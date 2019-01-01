@@ -30,45 +30,37 @@ class Client(object):
         self.servers = servers
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.settimeout(5)
-        self._results_handler_thread = threading.Thread(
-            target=self._get_results_handler)
-        self._results_handler_thread.setDaemon(True)
-        self._results_handler_thread.start()
         self._results = {}
         self._response_timeout = response_timeout
         self._debug = debug
         self._request_id_generator = itertools.count()
 
     def _get_results_handler(self):
-        while True:
-            try:
-                data, server = self.socket.recvfrom(4096)
-                udp_header = struct.unpack('!Hhhh', data[:8])
-                if self._debug:
-                    print(
-                        'memcached_udp: results_handler [server]: {0}'.format(
-                            server))
-                    print('memcached_udp: results_handler [data]: {0}'.format(
-                        data))
-                    print('memcached_udp: id={0}, packet_number={1}, '
-                          'total_packets={2}, misc={3}'.format(*udp_header))
+        try:
+            data, server = self.socket.recvfrom(4096)
+            udp_header = struct.unpack('!Hhhh', data[:8])
+            if self._debug:
+                print(
+                    'memcached_udp: results_handler [server]: {0}'.format(
+                        server))
+                print('memcached_udp: results_handler [data]: {0}'.format(
+                    data))
+                print('memcached_udp: id={0}, packet_number={1}, '
+                      'total_packets={2}, misc={3}'.format(*udp_header))
 
-                request_id = udp_header[0]
-                if request_id in self._results:
-                    self._results[request_id] = data[8:]
-                elif self._debug:
-                    print('memcached_udp: request id not found in results - '
-                          'ignoring... [request_id={0}]'.format(request_id))
+            request_id = udp_header[0]
+            if request_id in self._results:
+                return data[8:]
+            elif self._debug:
+                print('memcached_udp: request id not found in results - '
+                      'ignoring... [request_id={0}]'.format(request_id))
 
-            except socket.timeout:
-                pass
+        except socket.timeout:
+            return None
 
     @staticmethod
     def _get_udp_header(request_id):
         return struct.pack('!Hhhh', request_id, 0, 1, 0)
-
-    def _pick_server(self, key):
-        return self.servers[hash(key) % len(self.servers)]
 
     def _get_request_id(self, server):
         request_id = advance_iterator(self._request_id_generator)
@@ -81,21 +73,8 @@ class Client(object):
         self._results[request_id] = None
         return request_id
 
-    def _wait_for_result(self, server, request_id):
-        deadline = time.time() + self._response_timeout
-        try:
-            while not self._results[request_id]:
-                if time.time() >= deadline:
-                    raise self.MemcachedServerNotRespondingError(
-                        'Memcached server is not responding: {0}'.format(
-                            server))
-                time.sleep(0.1)
-            return self._results[request_id]
-        finally:
-            del self._results[request_id]
-
     def set(self, key, value):
-        server = self._pick_server(key)
+        server = self.servers[0]
         request_id = self._get_request_id(server)
         cmd = b''.join([
             self._get_udp_header(request_id),
@@ -108,15 +87,14 @@ class Client(object):
         ])
 
         self.socket.sendto(cmd, server)
-
-        r = self._wait_for_result(server, request_id)
+        r = self._get_results_handler()
 
         if r.split(b'\r\n')[0] != b'STORED':
             raise RuntimeError(
                 'Error storing "{0}" in {1}'.format(key, server))
 
     def get(self, key):
-        server = self._pick_server(key)
+        server = self.servers[0]
         request_id = self._get_request_id(server)
         cmd = b''.join([
             self._get_udp_header(request_id),
@@ -126,8 +104,7 @@ class Client(object):
         ])
 
         self.socket.sendto(cmd, server)
-
-        r = self._wait_for_result(server, request_id)
+        r = self._get_results_handler()
 
         if r.startswith(b'VALUE'):
             arr = r.split(b'\r\n')
